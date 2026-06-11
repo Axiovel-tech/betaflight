@@ -160,7 +160,27 @@ static void updateState(const fdm_packet* pkt)
 //    printf("[gyr]%lf,%lf,%lf\n", pkt->imu_angular_velocity_rpy[0], pkt->imu_angular_velocity_rpy[1], pkt->imu_angular_velocity_rpy[2]);
 
     // temperature in 0.01 C = 25 deg
-    virtualBaroSet(pkt->pressure, 2500);
+    // AV fork (axio-nav sim): the aeroloop_gazebo (gz branch) BetaflightPlugin
+    // fdmPacket carries no pressure field; the trailing bytes SITL reads as
+    // `pressure` are uninitialized plugin stack memory (the plugin's
+    // "pkt.escTemperature[4] = {};" zeroes nothing), typically a positive
+    // denormal like 6.9e-310. A non-positive/garbage pressure permanently
+    // blocks baro calibration (and thus arming), because
+    // performBaroCalibrationCycle() is only reached when pressure > 0 and
+    // baroInit() ignores baro_hardware=NONE when USE_VIRTUAL_BARO is set.
+    // Derive ISA pressure from FDM altitude instead (mirrors what Betaflight
+    // master's SITL_GAZEBO config does natively). Treat anything below
+    // 1000 Pa as "absent" so FDMs that do send pressure keep working.
+    double pressurePa = pkt->pressure;
+    if (!(pressurePa > 1000.0)) {
+#if defined(USE_VIRTUAL_GPS)
+        const double altM = pkt->position_xyz[2]; // [lon, lat, alt] in VIRTUAL_GPS mode
+#else
+        const double altM = -pkt->position_xyz[2]; // NED down -> altitude
+#endif
+        pressurePa = 101325.0 * pow(1.0 - 2.25577e-5 * altM, 5.25588);
+    }
+    virtualBaroSet(pressurePa, 2500);
 #if !defined(USE_IMU_CALC)
 #if defined(SET_IMU_FROM_EULER)
     // set from Euler
