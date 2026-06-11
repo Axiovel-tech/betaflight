@@ -255,6 +255,20 @@ void tcpDataOut(tcpPort_t *instance)
 void tcpDataIn(tcpPort_t *instance, uint8_t* ch, int size)
 {
     tcpPort_t *s = (tcpPort_t *)instance;
+
+    // AV fork: callback-driven receivers (serial RX providers such as CRSF
+    // register an rxCallback through openSerialPort) never poll the RX
+    // buffer -- on hardware the UART ISR hands each byte straight to the
+    // callback (see e.g. platform/STM32/serial_uart_stm32f4xx.c). Mirror
+    // that here so the stock CRSF RX codepath works over the SITL TCP
+    // serial ports; polling consumers (MSP/CLI) keep the buffered path.
+    if (s->port.rxCallback) {
+        while (size--) {
+            s->port.rxCallback(*(ch++), s->port.rxCallbackData);
+        }
+        return;
+    }
+
     pthread_mutex_lock(&s->rxLock);
 
     while (size--) {

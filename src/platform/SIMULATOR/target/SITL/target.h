@@ -99,6 +99,19 @@
 // Axiovel fork: axio-nav state link, served over the SITL TCP serial ports
 #define USE_TELEMETRY_STATE_LINK
 
+// Axiovel fork: serial RX with the CRSF provider. common_pre.h skips its
+// whole serial-RX block when SITL is defined, so the provider must be
+// defined here (the stock #undefs below were vestigial). axio-nav drives
+// Betaflight through CRSF RC frames on a UART (TCP port in SITL), so sim
+// runs exercise the identical stock CRSF RX codepath as hardware --
+// including real failsafe-on-frame-loss semantics, which the UDP 9004 RC
+// path can never provide (its frame status is always RX_FRAME_COMPLETE).
+// USE_CRSF_V3 stays off: baud negotiation is meaningless on a TCP serial
+// port and its error-fallback path calls serialSetBaudRate, which the TCP
+// serial vtable does not implement.
+#define USE_SERIALRX
+#define USE_SERIALRX_CRSF
+
 #ifdef USE_GPS
 #define USE_VIRTUAL_GPS
 #endif
@@ -120,8 +133,9 @@
 #undef USE_OSD
 #undef USE_RX_PPM
 #undef USE_RX_PWM
-#undef USE_SERIALRX
-#undef USE_SERIALRX_CRSF
+// AV fork: no #undef of USE_SERIALRX / USE_SERIALRX_CRSF here -- they are
+// deliberately defined above. The remaining provider #undefs are kept
+// verbatim from stock (they are no-ops on SITL, see comment above).
 #undef USE_SERIALRX_GHST
 #undef USE_SERIALRX_IBUS
 #undef USE_SERIALRX_SBUS

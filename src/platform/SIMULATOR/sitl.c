@@ -18,6 +18,7 @@
  * If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -437,6 +438,15 @@ uint64_t millis64_real(void)
     return 1.0e3*((ts.tv_sec + (ts.tv_nsec*1.0e-9)) - (start_time.tv_sec + (start_time.tv_nsec*1.0e-9)));
 }
 
+// AV fork: snapshot of the last micros64() result for cross-thread readers.
+// micros64() itself is NOT thread-safe (static accumulator advanced by
+// wall-delta * simRate); it must only ever be called from the main loop.
+// The TCP serial RX callback path (CRSF bytes, dyad thread) needs a
+// timestamp, so it reads this monotonic snapshot instead -- at the main
+// loop's ~9 kHz call rate it is at most ~0.1 ms stale, far below the CRSF
+// inter-frame gap the consumer measures.
+static _Atomic uint64_t microsSnapshot = 0;
+
 uint64_t micros64(void)
 {
     static uint64_t last = 0;
@@ -446,7 +456,9 @@ uint64_t micros64(void)
     out += (now - last) * simRate;
     last = now;
 
-    return out / 1000;
+    const uint64_t us = out / 1000;
+    atomic_store_explicit(&microsSnapshot, us, memory_order_relaxed);
+    return us;
 }
 
 uint64_t millis64(void)
@@ -464,6 +476,16 @@ uint64_t millis64(void)
 uint32_t micros(void)
 {
     return micros64() & 0xFFFFFFFF;
+}
+
+// AV fork: ISR-context time. Serial RX providers (CRSF) timestamp received
+// bytes with microsISR(); on hardware it reads the cycle counter safely
+// from interrupt context. In SITL the "ISR" is the dyad TCP thread, which
+// must not advance the (thread-unsafe) sim clock -- return the main loop's
+// latest micros64() snapshot instead.
+uint32_t microsISR(void)
+{
+    return (uint32_t)atomic_load_explicit(&microsSnapshot, memory_order_relaxed);
 }
 
 uint32_t millis(void)
