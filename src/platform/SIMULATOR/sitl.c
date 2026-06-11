@@ -154,9 +154,25 @@ static void updateState(const fdm_packet* pkt)
     virtualAccSet(virtualAccDev, x, y, z);
 //    printf("[acc]%lf,%lf,%lf\n", pkt->imu_linear_acceleration_xyz[0], pkt->imu_linear_acceleration_xyz[1], pkt->imu_linear_acceleration_xyz[2]);
 
+    // AV fork (axio-nav sim): Gazebo-bridge gyro frame conversion backported
+    // from Betaflight master (26524e20d "SITL: Gazebo Harmonic model fixes",
+    // gated upstream by ENABLE_GAZEBO_BRIDGE in 035a4d655). The
+    // BetaflightPlugin reads angular velocity from the IMU *sensor* entity
+    // (components::AngularVelocity on imuEntity), so the data arrives in the
+    // sensor frame. The IMU sensor pose is Rx(pi) relative to the FLU link,
+    // which makes the sensor frame effectively FRD (X=fwd, Y=right, Z=down).
+    //
+    // BF gyro conventions:
+    //   Roll  = +wx_FRD (roll right)                               -> keep X
+    //   Pitch = -wy_FRD (BF positive = nose down, opposite to FRD) -> negate Y
+    //   Yaw   = +wz_FRD (CW viewed from above)                     -> keep Z
+    //
+    // The 2025.12 negation of Z inverted the yaw-rate feedback against this
+    // plugin: positive feedback in the yaw loop, observed as the ~300 deg/s
+    // uncontrolled yaw spin in axio-nav M3 (docs/sim-stack-spike.md bug 5).
     x = constrain(pkt->imu_angular_velocity_rpy[0] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     y = constrain(-pkt->imu_angular_velocity_rpy[1] * GYRO_SCALE * RAD2DEG, -32767, 32767);
-    z = constrain(-pkt->imu_angular_velocity_rpy[2] * GYRO_SCALE * RAD2DEG, -32767, 32767);
+    z = constrain(pkt->imu_angular_velocity_rpy[2] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     virtualGyroSet(virtualGyroDev, x, y, z);
 //    printf("[gyr]%lf,%lf,%lf\n", pkt->imu_angular_velocity_rpy[0], pkt->imu_angular_velocity_rpy[1], pkt->imu_angular_velocity_rpy[2]);
 
@@ -209,7 +225,23 @@ static void updateState(const fdm_packet* pkt)
     zf = atan2(t3, t4) * RAD2DEG;
     imuSetAttitudeRPY(xf, -yf, zf); // yes! pitch was inverted!!
 #else
-    imuSetAttitudeQuat(pkt->imu_orientation_quat[0], pkt->imu_orientation_quat[1], pkt->imu_orientation_quat[2], pkt->imu_orientation_quat[3]);
+    // AV fork (axio-nav sim): Gazebo-bridge attitude frame conversion
+    // backported from Betaflight master (26524e20d / 035a4d655,
+    // ENABLE_GAZEBO_BRIDGE). The Gazebo BetaflightPlugin computes the
+    // quaternion as Rx(pi)*M*Rx(pi) (a similarity transform), but Betaflight
+    // needs the body(FRD)-to-world(NED) quaternion:
+    //   ENUtoNED * M * FRDtoFLU = Rz(pi/2) * Rx(pi) * M * Rx(pi).
+    // Pre-multiply by Rz(90 deg) to correct: q' = q_Rz(pi/2) * q_plugin.
+    // Without this, BF's attitude (and angle mode) is rotated relative to
+    // the world, the residual hover drift of docs/sim-stack-spike.md bug 5.
+    {
+        const float qw = pkt->imu_orientation_quat[0];
+        const float qx = pkt->imu_orientation_quat[1];
+        const float qy = pkt->imu_orientation_quat[2];
+        const float qz = pkt->imu_orientation_quat[3];
+        static const float k = 0.70710678f; // cos(pi/4) = sin(pi/4) = sqrt(2)/2
+        imuSetAttitudeQuat(k * (qw - qz), k * (qx - qy), k * (qy + qx), k * (qz + qw));
+    }
 #endif
 #endif
 
@@ -217,13 +249,35 @@ static void updateState(const fdm_packet* pkt)
     const double longitude = pkt->position_xyz[0];
     const double latitude = pkt->position_xyz[1];
     const double altitude = pkt->position_xyz[2];
+
+    // AV fork (axio-nav sim): GPS mirror backported from Betaflight master
+    // (26524e20d / 035a4d655, ENABLE_GAZEBO_BRIDGE). Gazebo Harmonic's
+    // SphericalFromLocalPosition inverts horizontal position deltas: moving
+    // East in the ENU world frame produces DECREASING longitude, and moving
+    // North produces DECREASING latitude. Mirror the GPS position around the
+    // initial origin to correct this 180-degree horizontal inversion.
+    // Assumes the first FDM packet arrives while the vehicle is at its spawn
+    // position; the axio-nav harness starts the world before the SITL, which
+    // guarantees this.
+    static double originLat = 0, originLon = 0;
+    static bool gpsOriginSet = false;
+    if (!gpsOriginSet) {
+        originLat = latitude;
+        originLon = longitude;
+        gpsOriginSet = true;
+    }
+    const double correctedLat = 2.0 * originLat - latitude;
+    const double correctedLon = 2.0 * originLon - longitude;
+
     const double speed = sqrt(sq(pkt->velocity_xyz[0]) + sq(pkt->velocity_xyz[1]));
     const double speed3D = sqrt(sq(pkt->velocity_xyz[0]) + sq(pkt->velocity_xyz[1]) + sq(pkt->velocity_xyz[2]));
+    // Plugin provides ENU velocity when spherical coords configured: [0]=East, [1]=North.
+    // Course = atan2(East, North) gives standard aviation bearing from North, clockwise.
     double course = atan2(pkt->velocity_xyz[0], pkt->velocity_xyz[1]) * RAD2DEG;
     if (course < 0.0) {
         course += 360.0;
     }
-    setVirtualGPS(latitude, longitude, altitude, speed, speed3D, course);
+    setVirtualGPS(correctedLat, correctedLon, altitude, speed, speed3D, course);
 #endif
 
 #if defined(SIMULATOR_IMU_SYNC)
