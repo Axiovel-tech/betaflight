@@ -96,6 +96,20 @@ uint16_t gyroSetSampleRate(gyroDev_t *gyro)
             break;
     }
 
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC)
+    // AXIO-LOCKSTEP (sim-only, runtime-gated): with the PID loop stepped
+    // 1:1 by FDM packets the honest sample rate is the FDM step rate --
+    // see simulatorLockstepGyroRateHz() in platform/SIMULATOR/sitl.c for
+    // the full rationale. 0 (stock mode) leaves the rates untouched.
+    extern uint16_t simulatorLockstepGyroRateHz(void);
+    const uint16_t lockstepRateHz = simulatorLockstepGyroRateHz();
+    if (lockstepRateHz) {
+        gyro->gyroRateKHz = GYRO_RATE_1_kHz; // nearest enum; register-config only
+        gyroSampleRateHz = lockstepRateHz;
+        accSampleRateHz = lockstepRateHz;
+    }
+#endif
+
     gyro->mpuDividerDrops  = 0; // we no longer use the gyro's sample divider
     gyro->accSampleRateHz = accSampleRateHz;
     return gyroSampleRateHz;

@@ -134,6 +134,7 @@ static _Atomic uint64_t microsSnapshot = 0;
 //    rows are keyed to the stock (wall*simRate) clock instead, which
 //    isolates clock nondeterminism in A/B experiments.
 static bool lockstepEnabled = false;
+static uint16_t lockstepRateHz = 250;          // FDM step rate (SITL_LOCKSTEP_RATE_HZ)
 static _Atomic uint64_t lockstepVirtualNs = 0; // the one true clock in lockstep mode
 static _Atomic bool lockstepEngaged = false;
 static uint64_t lockstepBaseNs = 0;            // virtual time at engagement
@@ -243,6 +244,16 @@ int targetParseArgs(int argc, char * argv[])
     if (plan && plan[0]) {
         lockstepLoadRcPlan(plan);
     }
+    // AXIO-LOCKSTEP: the FDM step rate (= the honest gyro/PID sample rate,
+    // see simulatorLockstepGyroRateHz). Default 250 Hz, the axio-nav world's
+    // physics rate; override with SITL_LOCKSTEP_RATE_HZ for other worlds.
+    const char *lsRate = getenv("SITL_LOCKSTEP_RATE_HZ");
+    if (lsRate && lsRate[0]) {
+        lockstepRateHz = (uint16_t)atoi(lsRate);
+    }
+    if (lockstepEnabled) {
+        printf("[SITL][lockstep] gyro/PID timebase: %u Hz (FDM step rate)\n", lockstepRateHz);
+    }
 
     printf("[SITL] The SITL will output to IP %s:%d (Gazebo) and %s:%d (RealFlightBridge)\n",
            simulator_ip, PORT_PWM, simulator_ip, PORT_PWM_RAW);
@@ -271,6 +282,21 @@ bool simulatorLockstepRealtimeParking(void)
 {
     return lockstepEnabled
         && atomic_load_explicit(&lockstepBootMotorSent, memory_order_acquire);
+}
+
+// AXIO-LOCKSTEP: the honest sensor/PID sample rate (gyro_sync.c hook).
+// In lockstep mode the realtime gyro/filter/PID block runs EXACTLY once
+// per FDM step, so the believed sample rate must be the step rate.
+// Without this the virtual gyro claims the stock 8 kHz: every dT-derived
+// constant (PID I/D scaling, every pt1/biquad filter coefficient, RC
+// smoothing, ...) is then computed for 125 us but applied at 4 ms steps
+// -- effective filter cutoffs / 32, D-term x 32 -- a sluggish, wrongly
+// tuned inner loop that destabilized the axio-nav position cascade in
+// closed loop (S1 finding; the spike's open-loop RC-plan hover masked
+// it). Returns 0 in stock mode (no override).
+uint16_t simulatorLockstepGyroRateHz(void)
+{
+    return lockstepEnabled ? lockstepRateHz : 0;
 }
 
 #define RAD2DEG (180.0 / M_PI)
@@ -780,6 +806,20 @@ uint64_t micros64(void)
             // throttled; only a genuinely waiting/paused SITL backs off.
             if (++sameCount > 1024) {
                 microsleep(1);
+                // Freeze diagnostic (wedge triage): a clock frozen for
+                // seconds of WALL time is either a paused Gazebo /
+                // offline plugin (pending_fdm=0: nothing to apply) or a
+                // stuck deferred apply (pending_fdm=1: a buffered packet
+                // the scheduler never gets to drain). Logged at most
+                // every 2 s, main thread only.
+                static uint64_t lastFreezeLogUs = 0;
+                const uint64_t wallUs = micros64_real();
+                if (sameCount > 200000 && wallUs - lastFreezeLogUs > 2000000) {
+                    lastFreezeLogUs = wallUs;
+                    fprintf(stderr, "[SITL][lockstep] clock frozen at %llu us (pending_fdm=%d)\n",
+                            (unsigned long long)us,
+                            atomic_load_explicit(&lockstepPendingValid, memory_order_relaxed) ? 1 : 0);
+                }
             }
         } else {
             lastSeenUs = us;
