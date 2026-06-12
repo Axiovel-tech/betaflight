@@ -667,8 +667,13 @@ static void* tcpThread(void* data)
     dyad_setTickInterval(0.2f);
     dyad_setUpdateTimeout(0.01f);
 
+    // AV fork: tcpServe() = drain all TX rings into dyad + one
+    // dyad_update, under the dyad lock -- this thread is the single
+    // dyad writer (producers only append to the per-port TX rings; the
+    // old producer-side dyad_write raced dyad_update and tore
+    // state-link frames, see drivers/serial_tcp.c).
     while (workerRunning) {
-        dyad_update();
+        tcpServe();
     }
 
     dyad_shutdown();

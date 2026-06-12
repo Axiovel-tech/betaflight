@@ -350,25 +350,18 @@ void stateLinkProcess(timeUs_t currentTimeUs)
     uint8_t buf[STATE_LINK_STATE_FRAME_SIZE];
     const int length = stateLinkSerializeStateFrame(buf, &frame);
 
-#ifdef SIMULATOR_BUILD
-    // SITL serves serial ports as TCP servers (drivers/serial_tcp.c). The
-    // driver's batched writeBuf (AV fork, tcpWriteBuf) appends the whole
-    // frame to the TX ring and flushes it with ONE dyad_write: never
-    // blocking (before a client attaches the ring just wraps and the
-    // receiver resynchronizes via sync hunt + CRC), and it keeps the
-    // frame contiguous against the dyad thread -- the previous per-byte
-    // serialWrite loop made 62 racy dyad_write calls per frame (observed
-    // as rare duplicated/torn frames at 250 Hz; tcpWriteBuf comment).
-    serialWriteBuf(stateLinkPort, buf, length);
-#else
     // Never block: if the TX buffer can't take a full frame, skip this
     // cycle. seq only advances on frames actually queued, so a skipped
-    // frame does not appear as wire loss to the receiver.
+    // frame does not appear as wire loss to the receiver. One path for
+    // hardware and SITL since the fork's single-writer TCP TX (the SITL
+    // driver's batched tcpWriteBuf appends the whole frame to the TX
+    // ring under one lock and the tcpThread alone hands it to dyad --
+    // whole-frame atomicity on the wire; pre-client the free-space
+    // check here skips cleanly instead of wrapping the ring).
     if (serialTxBytesFree(stateLinkPort) < (uint32_t)length) {
         return;
     }
     serialWriteBuf(stateLinkPort, buf, length);
-#endif
 
     stateLinkSeq++;
 }

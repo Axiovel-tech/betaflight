@@ -46,7 +46,9 @@ serialPort_t *serTcpOpen(serialPortIdentifier_e id, serialReceiveCallbackPtr rxC
 
 // tcpPort API
 void tcpDataIn(tcpPort_t *instance, uint8_t* ch, int size);
-void tcpDataOut(tcpPort_t *instance);
+void tcpDataOut(tcpPort_t *instance);      // AV fork: tcpThread only (see tcpServe)
+void tcpServe(void);                       // AV fork: the tcpThread loop body --
+                                           // single-writer dyad drain + dyad_update
 
 bool tcpIsStart(void);
 bool* tcpGetUsed(void);

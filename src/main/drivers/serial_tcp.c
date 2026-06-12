@@ -23,11 +23,13 @@
  * Dominic Clifton - Serial port abstraction, Separation of common STM32 code for cleanflight, various cleanups.
  * Hamasaki/Timecop - Initial baseflight code
 */
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 
 #include "platform.h"
 
@@ -44,6 +46,24 @@ static const struct serialPortVTable tcpVTable; // Forward
 static tcpPort_t tcpSerialPorts[SERIAL_PORT_COUNT];
 static bool tcpPortInitialized[SERIAL_PORT_COUNT];
 static bool tcpStart = false;
+
+// AV fork: dyad is NOT thread-safe, so every dyad call is serialized by
+// this lock and -- outside of the one-shot listen-stream creation in
+// tcpReconfigure() -- happens on the SITL tcpThread only, inside
+// tcpServe(). Producer threads (scheduler main loop: state link, MSP,
+// CLI) never touch dyad; they only append to the per-port TX rings
+// (txLock) that tcpServe() drains. See tcpServe() for the race this
+// kills.
+//
+// dyadLockWanted is the anti-starvation handshake: tcpServe()
+// re-acquires the lock back-to-back around a BLOCKING select (the lock
+// is free only for nanoseconds per pass) and pthread mutexes are not
+// fair, so a boot-time tcpReconfigure() on the main thread can lose the
+// race for seconds -- observed as the SITL never binding its serial
+// ports (CLI connection refused). A pending taker raises the flag and
+// tcpServe() yields before relocking, bounding the wait to ~one pass.
+static pthread_mutex_t dyadLock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool dyadLockWanted = false;
 
 bool tcpIsStart(void)
 {
@@ -79,6 +99,21 @@ static void onAccept(dyad_Event *e)
     }
     s->clientCount++;
     fprintf(stderr, "[NEW]UART%u: %d,%d\n", s->id + 1U, s->connected, s->clientCount);
+
+    // AV fork: drop whatever queued while no client was attached -- a new
+    // client must start at a LIVE stream boundary. With the single-writer
+    // TX ring the backlog would otherwise be the OLDEST pre-client bytes:
+    // for the state link that is boot-time frames whose stale timestamps
+    // poison a frame-paced receiver's clock (the axio-nav bridge maps the
+    // AXPI sender clock against its frame-derived nav clock ONCE, on the
+    // first accepted fix -- a connect-time backlog of stale frames makes
+    // every later fix map seconds into the past and the position track
+    // never validates). The pre-fork wrap behavior incidentally delivered
+    // the NEWEST bytes, which this reset now provides deliberately.
+    pthread_mutex_lock(&s->txLock);
+    s->port.txBufferTail = s->port.txBufferHead;
+    pthread_mutex_unlock(&s->txLock);
+
     s->conn = e->remote;
     dyad_setNoDelay(e->remote, 1);
     dyad_setTimeout(e->remote, 120);
@@ -112,6 +147,16 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
     s->clientCount = 0;
     s->id = id;
     s->conn = NULL;
+
+    // AV fork: stream creation mutates dyad's global stream list, which
+    // the tcpThread is concurrently iterating in dyad_update() -- take
+    // the dyad lock (one-shot per port, at init; blocking the main
+    // thread for up to one service pass here is harmless). The wanted
+    // flag keeps the relock-in-a-loop tcpThread from starving us (see
+    // its declaration).
+    atomic_store_explicit(&dyadLockWanted, true, memory_order_release);
+    pthread_mutex_lock(&dyadLock);
+    atomic_store_explicit(&dyadLockWanted, false, memory_order_relaxed);
     s->serv = dyad_newStream();
     dyad_setNoDelay(s->serv, 1);
     dyad_addListener(s->serv, DYAD_EVENT_ACCEPT, onAccept, s);
@@ -121,6 +166,7 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
     } else {
         fprintf(stderr, "bind port %u for UART%u failed!!\n", (unsigned)BASE_PORT + id + 1, (unsigned)id + 1);
     }
+    pthread_mutex_unlock(&dyadLock);
     return s;
 }
 
@@ -216,9 +262,39 @@ static uint8_t tcpRead(serialPort_t *instance)
     return ch;
 }
 
+// AV fork: bounded wait for the tcpThread to drain the TX ring when it
+// is full and a client is attached -- the hardware-UART semantic
+// (serialWrite spins on a full TX buffer until the ISR drains it),
+// which large single-pass writers (CLI dump/diff) rely on. Pre-client
+// the ring wraps silently exactly as before (the receiver
+// resynchronizes via sync hunt + CRC). The wait is bounded so a wedged
+// service thread degrades to the wrap, never to a deadlocked main
+// loop; in-flight writers (state link 63 B / 4 ms, MSP replies) never
+// come close to filling the ring between two service passes.
+static void tcpWaitTxSpace(tcpPort_t *s, uint32_t needed)
+{
+    if (needed > s->port.txBufferSize - 1) {
+        needed = s->port.txBufferSize - 1;
+    }
+    for (int i = 0; i < 2000; i++) {   // <= ~200 ms, >> one service pass
+        if (!s->connected || tcpTotalTxBytesFree(&s->port) >= needed) {
+            return;
+        }
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+// AV fork, single-writer TX: producers only APPEND to the per-port TX
+// ring here -- the dyad_write happens on the tcpThread (tcpServe), so
+// the producer-thread dyad_write that raced dyad_update's
+// send/vec_splice on stream->writeBuffer is gone entirely (the torn /
+// duplicated state-link frames of the batched-TX commit's residual).
 static void tcpWrite(serialPort_t *instance, uint8_t ch)
 {
     tcpPort_t *s = (tcpPort_t *)instance;
+
+    tcpWaitTxSpace(s, 1);
     pthread_mutex_lock(&s->txLock);
 
     s->port.txBuffer[s->port.txBufferHead] = ch;
@@ -228,26 +304,22 @@ static void tcpWrite(serialPort_t *instance, uint8_t ch)
         s->port.txBufferHead++;
     }
     pthread_mutex_unlock(&s->txLock);
-
-    tcpDataOut(s);
 }
 
-// AV fork: batched, never-blocking buffer write. One ring append + ONE
-// tcpDataOut (= one dyad_write) per call, instead of the generic
-// serialWriteBuf fallback's per-byte tcpWrite/tcpDataOut loop. Besides
-// the efficiency, this shrinks the exposure of the long-standing dyad
-// thread-unsafety (dyad_write here, on the producer thread, races
-// dyad_update's send/shift on the tcpThread; observed as rare duplicated
-// or torn frames on the 250 Hz state link, ~0.1/s) by ~60x for framed
-// writers. Like tcpWrite, the ring silently wraps when no client is
-// attached (the receiver resynchronizes via sync hunt + CRC) -- it never
-// busy-waits, which is why the state link could not use the generic
-// serialWriteBuf (see telemetry/state_link.c).
+// AV fork: batched buffer write -- one ring append per call (single
+// txLock hold keeps the frame contiguous in the ring), drained by
+// tcpServe() on the tcpThread. Framed writers (state link) get
+// whole-frame atomicity; tcpWaitTxSpace above gives big writers the
+// hardware blocking semantic without ever blocking pre-client.
 static void tcpWriteBuf(serialPort_t *instance, const void *data, int count)
 {
     tcpPort_t *s = (tcpPort_t *)instance;
     const uint8_t *p = (const uint8_t *)data;
 
+    if (count <= 0) {
+        return;
+    }
+    tcpWaitTxSpace(s, (uint32_t)count);
     pthread_mutex_lock(&s->txLock);
     while (count--) {
         s->port.txBuffer[s->port.txBufferHead] = *(p++);
@@ -258,10 +330,11 @@ static void tcpWriteBuf(serialPort_t *instance, const void *data, int count)
         }
     }
     pthread_mutex_unlock(&s->txLock);
-
-    tcpDataOut(s);
 }
 
+// Drain one port's TX ring into dyad. AV fork: tcpThread only (under
+// dyadLock, via tcpServe) -- dyad_write from any other thread races
+// dyad_update and tears frames; see tcpServe().
 void tcpDataOut(tcpPort_t *instance)
 {
     tcpPort_t *s = (tcpPort_t *)instance;
@@ -280,6 +353,40 @@ void tcpDataOut(tcpPort_t *instance)
     s->port.txBufferTail = s->port.txBufferHead;
 
     pthread_mutex_unlock(&s->txLock);
+}
+
+// AV fork: one single-writer dyad service pass; the SITL tcpThread's
+// entire loop body. ALL dyad access happens here, under dyadLock (the
+// lock additionally covers the one-shot listen-stream creation in
+// tcpReconfigure): drain every initialized port's TX ring into
+// dyad_write, then one dyad_update (select + socket I/O + event
+// dispatch; flushes the freshly written buffers in the same pass via
+// dyad's WRITTEN flag). Rationale: dyad is not thread-safe -- the
+// previous producer-thread dyad_write raced dyad_update's
+// send/vec_splice on stream->writeBuffer, observed as torn/duplicated
+// state-link frames (~1 CRC event per 10 min-runs at 250 Hz AFTER the
+// batched-TX commit shrank the per-frame exposure ~60x; bursty). Worst
+// case added TX latency vs the producer-side dyad_write is one service
+// pass (<= the 10 ms dyad select timeout), the same bound the old
+// path's flush-inside-dyad_update already had.
+void tcpServe(void)
+{
+    // Yield to a pending lock taker first (anti-starvation handshake,
+    // see dyadLockWanted): without this, the back-to-back relock around
+    // the blocking select inside dyad_update() can starve a boot-time
+    // serTcpOpen for seconds and the serial ports never bind.
+    if (atomic_load_explicit(&dyadLockWanted, memory_order_acquire)) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    pthread_mutex_lock(&dyadLock);
+    for (int i = 0; i < SERIAL_PORT_COUNT; i++) {
+        if (tcpPortInitialized[i]) {
+            tcpDataOut(&tcpSerialPorts[i]);
+        }
+    }
+    dyad_update();
+    pthread_mutex_unlock(&dyadLock);
 }
 
 void tcpDataIn(tcpPort_t *instance, uint8_t* ch, int size)
