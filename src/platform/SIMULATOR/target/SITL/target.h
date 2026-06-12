@@ -51,7 +51,13 @@
 //#define SIMULATOR_ACC_SYNC
 //#define SIMULATOR_GYRO_SYNC
 //#define SIMULATOR_IMU_SYNC
-//#define SIMULATOR_GYROPID_SYNC
+// AXIO-LOCKSTEP (AV fork): compile in the per-FDM PID-loop gate
+// (fc/core.c taskMainPidLoop trylocks mainLoopLock when this is defined).
+// The gate is RUNTIME-conditional: lockMainPID() in sitl.c returns 0
+// ("run freely", stock behaviour) unless the process is started with
+// SITL_LOCKSTEP=1 in the environment. Hardware targets never compile
+// this file; the core.c hook is additionally guarded by SIMULATOR_BUILD.
+#define SIMULATOR_GYROPID_SYNC
 
 // file name to save config
 #define EEPROM_FILENAME "eeprom.bin"
