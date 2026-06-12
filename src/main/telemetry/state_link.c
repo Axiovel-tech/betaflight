@@ -44,6 +44,13 @@
  * The transmitter passes it through unchanged in that configuration; see
  * stateLinkSampleState().
  *
+ * EXCEPTION (SITL, accel): under the same build condition, acc.accADC is
+ * NOT a specific-force sample: the FDM injects the physics engine's
+ * KINEMATIC body acceleration (gravity absent) with an all-axis
+ * negation, so the spec'd specific force has to be RECONSTRUCTED before
+ * serializing -- see the SIMULATOR_BUILD branch in stateLinkSampleState()
+ * for the full injection-chain derivation.
+ *
  * Data taps (provisional per spec, to be confirmed by the M2 bench
  * campaign):
  *   - gyro:  gyro.gyroADCf [deg/s] -- after the full gyro filter chain
@@ -53,9 +60,11 @@
  *            before RPM/dynamic notch"; no such intermediate signal
  *            exists in Betaflight 2025.12 -- gyroADCf is post-all-filters.
  *   - accel: acc.accADC [LSB, acc.dev.acc_1G per g] -- aligned and
- *            trim-corrected accelerometer sample.
+ *            trim-corrected accelerometer sample (true specific force on
+ *            hardware; reconstructed on SITL, see above).
  */
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -138,12 +147,9 @@ void stateLinkSampleState(stateLinkStateFrame_t *frame, timeUs_t currentTimeUs)
     frame->gyroRadS[1] = -DEGREES_TO_RADIANS(gyro.gyroADCf[Y]);
     frame->gyroRadS[2] = -DEGREES_TO_RADIANS(gyro.gyroADCf[Z]);
 
-    const float accScale = acc.dev.acc_1G_rec * STATE_LINK_GRAVITY_MSS;
-    frame->accelMps2[0] = acc.accADC.x * accScale;
-    frame->accelMps2[1] = -acc.accADC.y * accScale;
-    frame->accelMps2[2] = -acc.accADC.z * accScale;
-
     // Betaflight attitude quaternion -> wire body FRD -> world NED.
+    // (Sampled BEFORE the accel: the SITL accel branch below needs the
+    // wire attitude to reconstruct the spec'd specific force.)
     //
     // Two cases, matching exactly the build condition flight/imu.c uses
     // for its simulator-only rMat sign compensation:
@@ -173,6 +179,75 @@ void stateLinkSampleState(stateLinkStateFrame_t *frame, timeUs_t currentTimeUs)
     frame->quat[1] = q.x;
     frame->quat[2] = -q.y;
     frame->quat[3] = -q.z;
+#endif
+
+    const float accScale = acc.dev.acc_1G_rec * STATE_LINK_GRAVITY_MSS;
+#if defined(SIMULATOR_BUILD) && !defined(USE_IMU_CALC) && !defined(SET_IMU_FROM_EULER)
+    // SITL with FDM-injected sensors (same build condition as the
+    // quaternion case above): acc.accADC is NOT specific force, so the
+    // hardware passthrough below would violate the state-link spec
+    // (accel[3] = specific force, body FRD: a level resting vehicle
+    // reads (0, 0, -g)). The injection chain:
+    //
+    //  1. The Gazebo BetaflightPlugin (aeroloop_gazebo, gz branch) samples
+    //     components::LinearAcceleration on the IMU *sensor* entity: the
+    //     physics engine's KINEMATIC acceleration -- gravity absent, a
+    //     resting vehicle reads exactly 0 -- in the sensor frame, which
+    //     is body FRD (the sensor pose is Rx(pi) off the FLU link; same
+    //     provenance as the gyro, see sitl.c updateStateApply()).
+    //  2. sitl.c negates ALL THREE axes into accADC
+    //     (accADC = -a_FRD * ACC_SCALE) -- the stock negation predates
+    //     the gazebo bridge and matches no FRD->FLU mapping (that would
+    //     negate y/z only): accADC carries body-FLU kinematic
+    //     acceleration with an extra x sign flip.
+    //  3. The hardware FLU->FRD wire conversion (x, -y, -z) then nets
+    //     wire = (-a_x, +a_y, +a_z): kinematic, x-flipped, gravity-free.
+    //     Verified empirically against ground truth (axio-nav
+    //     estimator-v1 diagnostic run 20260612-164116: per-axis
+    //     correlation of the wire value vs truth kinematic body-frame
+    //     acceleration -1.000 / +0.993 / +0.982 at scale ~1; pre-arm
+    //     wire accel identically zero where specific force reads -g).
+    //
+    // Reconstruct the spec'd specific force instead: undo the injection
+    // negation to recover a_FRD, then subtract gravity rotated into the
+    // body frame with the SAME wire attitude this frame carries
+    // (f_b = a_b - R^T(q) * (0, 0, +g); R(q) maps body FRD -> world NED,
+    // so R^T g is the third row of R times g; q normalized defensively).
+    // A consumer's NED mechanization then computes R f_b + g = R a_b
+    // exactly. Fixing the injection in sitl.c instead would change what
+    // every other accADC consumer (acc calibration, BF's own filters/
+    // logging) has been validated against -- the transmitter-side fix
+    // keeps the correction next to the wire contract it serves, exactly
+    // like the quaternion case above.
+    const float ax = -acc.accADC.x * accScale;
+    const float ay = -acc.accADC.y * accScale;
+    const float az = -acc.accADC.z * accScale;
+
+    float qw = frame->quat[0];
+    float qx = frame->quat[1];
+    float qy = frame->quat[2];
+    float qz = frame->quat[3];
+    const float qn2 = (qw * qw) + (qx * qx) + (qy * qy) + (qz * qz);
+    if (qn2 > 0.0f) {
+        const float qs = 1.0f / sqrtf(qn2);
+        qw *= qs;
+        qx *= qs;
+        qy *= qs;
+        qz *= qs;
+    }
+    const float gbx = STATE_LINK_GRAVITY_MSS * 2.0f * ((qx * qz) - (qw * qy));
+    const float gby = STATE_LINK_GRAVITY_MSS * 2.0f * ((qy * qz) + (qw * qx));
+    const float gbz = STATE_LINK_GRAVITY_MSS * (1.0f - 2.0f * ((qx * qx) + (qy * qy)));
+
+    frame->accelMps2[0] = ax - gbx;
+    frame->accelMps2[1] = ay - gby;
+    frame->accelMps2[2] = az - gbz;
+#else
+    // Hardware: accADC is the real accelerometer sample -- true specific
+    // force, body FLU. FLU -> FRD: negate y and z.
+    frame->accelMps2[0] = acc.accADC.x * accScale;
+    frame->accelMps2[1] = -acc.accADC.y * accScale;
+    frame->accelMps2[2] = -acc.accADC.z * accScale;
 #endif
 
     // Post-mixer motor outputs, normalized to 0..2047 over the protocol

@@ -190,9 +190,23 @@ TEST(StateLinkTest, SampleStateMapsBetaflightToWireConventions)
     EXPECT_NEAR(-20.0f * M_PIf / 180, frame.gyroRadS[1], 1e-6f);
     EXPECT_NEAR(-30.0f * M_PIf / 180, frame.gyroRadS[2], 1e-6f);
 
+#if defined(SIMULATOR_BUILD) && !defined(USE_IMU_CALC) && !defined(SET_IMU_FROM_EULER)
+    // SITL: accADC carries FDM-injected KINEMATIC acceleration, all-axis
+    // negated (see state_link.c); the transmitter reconstructs specific
+    // force f_b = -accADC*scale - R^T(q)(0,0,g) with the wire attitude.
+    // Independently computed (python) for accADC=(512,256,-1024) at
+    // acc_1G=512 and q=(0.4,0.5,0.6,-0.7) (norm^2=1.26):
+    //   a_FRD = (-9.80665, -4.903325, 19.6133)
+    //   g_b   = (-9.184006, -3.424544, 0.311322)
+    EXPECT_NEAR(-0.622644f, frame.accelMps2[0], 1e-4f);
+    EXPECT_NEAR(-1.478781f, frame.accelMps2[1], 1e-4f);
+    EXPECT_NEAR(19.301978f, frame.accelMps2[2], 1e-4f);
+#else
+    // Hardware: accADC is true specific force, FLU -> FRD (negate y/z).
     EXPECT_NEAR(9.80665f, frame.accelMps2[0], 1e-4f);
     EXPECT_NEAR(-4.903325f, frame.accelMps2[1], 1e-4f);
     EXPECT_NEAR(19.6133f, frame.accelMps2[2], 1e-4f);
+#endif
 
 #if defined(SIMULATOR_BUILD) && !defined(USE_IMU_CALC) && !defined(SET_IMU_FROM_EULER)
     // SITL: internal quaternion already FRD->NED, transmitted unchanged.
@@ -221,6 +235,74 @@ TEST(StateLinkTest, SampleStateMapsBetaflightToWireConventions)
 
     EXPECT_EQ(STATE_LINK_FLAG_ARMED | STATE_LINK_FLAG_CALIBRATING, frame.flags);
 }
+
+#if defined(SIMULATOR_BUILD) && !defined(USE_IMU_CALC) && !defined(SET_IMU_FROM_EULER)
+// SITL specific-force reconstruction (state_link.c SIMULATOR_BUILD accel
+// branch): the wire must carry spec specific force -- a resting level
+// vehicle reads (0, 0, -g), NOT the FDM's kinematic zero. Canonical
+// attitudes, golden values per the spec definition.
+TEST(StateLinkTest, SampleStateSitlAccelIsSpecificForce)
+{
+    constexpr float kG = 9.80665f;
+
+    memset(&gyro, 0, sizeof(gyro));
+    memset(&acc, 0, sizeof(acc));
+    acc.dev.acc_1G_rec = 1.0f / 512;
+    testMotorCount = 0;
+    testBatteryVoltage = 0;
+    testAmperage = 0;
+    armingFlags = 0;
+    testFailsafeActive = false;
+    testGyroCalibrationComplete = true;
+    testAccCalibrationComplete = true;
+    testSensorsMask = 0;
+
+    stateLinkStateFrame_t frame;
+
+    // Resting, level (kinematic accel = 0 -> accADC = 0; q = identity):
+    // the pre-fix transmitter put exactly 0 on the wire here -- the
+    // signature non-conformance of the axio-nav estimator-v1 finding.
+    testQuaternion.w = 1.0f;
+    testQuaternion.x = 0.0f;
+    testQuaternion.y = 0.0f;
+    testQuaternion.z = 0.0f;
+    stateLinkSampleState(&frame, 0);
+    EXPECT_NEAR(0.0f, frame.accelMps2[0], 1e-5f);
+    EXPECT_NEAR(0.0f, frame.accelMps2[1], 1e-5f);
+    EXPECT_NEAR(-kG, frame.accelMps2[2], 1e-4f);
+
+    // Resting, inverted (roll pi): specific force points out the roof.
+    testQuaternion.w = 0.0f;
+    testQuaternion.x = 1.0f;
+    stateLinkSampleState(&frame, 0);
+    EXPECT_NEAR(0.0f, frame.accelMps2[0], 1e-4f);
+    EXPECT_NEAR(0.0f, frame.accelMps2[1], 1e-4f);
+    EXPECT_NEAR(kG, frame.accelMps2[2], 1e-4f);
+
+    // Resting, nose up 90 deg (pitch +pi/2): specific force along +x.
+    testQuaternion.w = 0.70710678f;
+    testQuaternion.x = 0.0f;
+    testQuaternion.y = 0.70710678f;
+    stateLinkSampleState(&frame, 0);
+    EXPECT_NEAR(kG, frame.accelMps2[0], 1e-4f);
+    EXPECT_NEAR(0.0f, frame.accelMps2[1], 1e-4f);
+    EXPECT_NEAR(0.0f, frame.accelMps2[2], 1e-4f);
+
+    // Dynamic, level: the injection-path x flip must be undone.
+    // accADC = (512, 256, -1024) at acc_1G = 512 was injected as
+    // a_FRD = -(accADC)/512*g = (-g, -g/2, 2g); f = a - (0,0,g).
+    testQuaternion.w = 1.0f;
+    testQuaternion.x = 0.0f;
+    testQuaternion.y = 0.0f;
+    acc.accADC.x = 512.0f;
+    acc.accADC.y = 256.0f;
+    acc.accADC.z = -1024.0f;
+    stateLinkSampleState(&frame, 0);
+    EXPECT_NEAR(-9.80665f, frame.accelMps2[0], 1e-4f);
+    EXPECT_NEAR(-4.903325f, frame.accelMps2[1], 1e-4f);
+    EXPECT_NEAR(9.80665f, frame.accelMps2[2], 1e-4f);
+}
+#endif
 
 TEST(StateLinkTest, SampleStateClampsAndFlags)
 {
