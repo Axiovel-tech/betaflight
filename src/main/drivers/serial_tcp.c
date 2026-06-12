@@ -232,6 +232,36 @@ static void tcpWrite(serialPort_t *instance, uint8_t ch)
     tcpDataOut(s);
 }
 
+// AV fork: batched, never-blocking buffer write. One ring append + ONE
+// tcpDataOut (= one dyad_write) per call, instead of the generic
+// serialWriteBuf fallback's per-byte tcpWrite/tcpDataOut loop. Besides
+// the efficiency, this shrinks the exposure of the long-standing dyad
+// thread-unsafety (dyad_write here, on the producer thread, races
+// dyad_update's send/shift on the tcpThread; observed as rare duplicated
+// or torn frames on the 250 Hz state link, ~0.1/s) by ~60x for framed
+// writers. Like tcpWrite, the ring silently wraps when no client is
+// attached (the receiver resynchronizes via sync hunt + CRC) -- it never
+// busy-waits, which is why the state link could not use the generic
+// serialWriteBuf (see telemetry/state_link.c).
+static void tcpWriteBuf(serialPort_t *instance, const void *data, int count)
+{
+    tcpPort_t *s = (tcpPort_t *)instance;
+    const uint8_t *p = (const uint8_t *)data;
+
+    pthread_mutex_lock(&s->txLock);
+    while (count--) {
+        s->port.txBuffer[s->port.txBufferHead] = *(p++);
+        if (s->port.txBufferHead + 1 >= s->port.txBufferSize) {
+            s->port.txBufferHead = 0;
+        } else {
+            s->port.txBufferHead++;
+        }
+    }
+    pthread_mutex_unlock(&s->txLock);
+
+    tcpDataOut(s);
+}
+
 void tcpDataOut(tcpPort_t *instance)
 {
     tcpPort_t *s = (tcpPort_t *)instance;
@@ -294,7 +324,7 @@ static const struct serialPortVTable tcpVTable = {
         .setMode = NULL,
         .setCtrlLineStateCb = NULL,
         .setBaudRateCb = NULL,
-        .writeBuf = NULL,
+        .writeBuf = tcpWriteBuf, // AV fork: batched TX (comment at definition)
         .beginWrite = NULL,
         .endWrite = NULL,
 };
