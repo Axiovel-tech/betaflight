@@ -51,6 +51,15 @@
 
 #include "sensors/gyro_init.h"
 
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC)
+// AXIO-LOCKSTEP: provided by the SITL platform (sitl.c). True only when the
+// process runs with SITL_LOCKSTEP=1 and boot has completed.
+extern bool simulatorLockstepRealtimeParking(void);
+// AXIO-LOCKSTEP: end-of-pass hook; applies the next buffered FDM packet
+// (sensors + clock step) once the non-realtime task drain is complete.
+extern void simulatorLockstepPassComplete(bool ranTask);
+#endif
+
 // DEBUG_SCHEDULER, timings for:
 // 0 - Average time spent executing check function
 // 1 - Time spent priortising
@@ -529,8 +538,23 @@ FAST_CODE void scheduler(void)
              * task is non-deterministic
              * Recover as best we can, advancing scheduling by a whole number of cycles
              */
-            nextTargetCycles += desiredPeriodCycles * (1 + (schedLoopRemainingCycles / -desiredPeriodCycles));
-            schedLoopRemainingCycles = cmpTimeCycles(nextTargetCycles, nowCycles);
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC)
+            // AXIO-LOCKSTEP (sim-only): in lockstep mode the clock is
+            // FDM-stepped and frozen between simulator packets; each step
+            // advances it by one whole physics period (>> gyro period), so
+            // this recovery would fire on EVERY step and re-land
+            // nextTargetCycles slightly ahead of the frozen clock -- a
+            // deadline that can never arrive by waiting. Skip the recovery:
+            // the boundary then reads as due exactly once per step (the
+            // realtime block re-anchors lastTargetCycles to the step time
+            // below). False unless SITL_LOCKSTEP=1; not compiled for
+            // hardware targets.
+            if (!simulatorLockstepRealtimeParking())
+#endif
+            {
+                nextTargetCycles += desiredPeriodCycles * (1 + (schedLoopRemainingCycles / -desiredPeriodCycles));
+                schedLoopRemainingCycles = cmpTimeCycles(nextTargetCycles, nowCycles);
+            }
         }
 
         // Tune out the time lost between completing the last task execution and re-entering the scheduler
@@ -616,7 +640,21 @@ FAST_CODE void scheduler(void)
                 taskCount = 0;
             }
 #endif
-            lastTargetCycles = nextTargetCycles;
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC)
+            // AXIO-LOCKSTEP (sim-only): anchor the next gyro deadline to the
+            // simulation step that just ran. With the clock frozen until the
+            // next FDM packet, the boundary stays exactly one gyro period
+            // ahead (never due), and the next step lands far beyond it
+            // (immediately due, recovery skipped above): one realtime pass
+            // per simulation step, while ordinary passes in between keep
+            // serving the non-realtime tasks.
+            if (simulatorLockstepRealtimeParking()) {
+                lastTargetCycles = clockMicrosToCycles(currentTimeUs);
+            } else
+#endif
+            {
+                lastTargetCycles = nextTargetCycles;
+            }
 
             gyroDev_t *gyro = gyroActiveDev();
 
@@ -700,7 +738,17 @@ FAST_CODE void scheduler(void)
     nowCycles = getCycleCounter();
     schedLoopRemainingCycles = cmpTimeCycles(nextTargetCycles, nowCycles);
 
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC)
+    // AXIO-LOCKSTEP (sim-only): on the frozen FDM-stepped clock the time
+    // remaining to the next gyro deadline is meaningless (it does not
+    // shrink by waiting), so it must not gate the non-realtime section --
+    // that would starve RX, serial, baro, ... Run the section on every
+    // pass; the realtime boundary fires once per simulation step
+    // regardless (see the recovery/anchor hooks above).
+    if (simulatorLockstepRealtimeParking() || !gyroEnabled || (schedLoopRemainingCycles > (int32_t)clockMicrosToCycles(CHECK_GUARD_MARGIN_US))) {
+#else
     if (!gyroEnabled || (schedLoopRemainingCycles > (int32_t)clockMicrosToCycles(CHECK_GUARD_MARGIN_US))) {
+#endif
         currentTimeUs = micros();
 
         // Update task dynamic priorities
@@ -742,6 +790,13 @@ FAST_CODE void scheduler(void)
                     // If there's no time to run the task, discount it from prioritisation unless aged sufficiently
                     // Don't block the SERIAL task.
                     if ((taskRequiredTimeCycles < schedLoopRemainingCycles) ||
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC)
+                        // AXIO-LOCKSTEP (sim-only): on the frozen lockstep
+                        // clock the remaining-time budget is meaningless --
+                        // the realtime boundary waits for the FDM stream,
+                        // not for us. Admit every due task by priority.
+                        simulatorLockstepRealtimeParking() ||
+#endif
                         ((scheduleCount & SCHED_TASK_DEFER_MASK) == 0) ||
                         ((task - tasks) == TASK_SERIAL)) {
                         selectedTaskDynamicPriority = task->dynamicPriority;
@@ -770,7 +825,12 @@ FAST_CODE void scheduler(void)
             // Allow a little extra time
             taskRequiredTimeCycles += taskGuardCycles;
 
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC)
+            // AXIO-LOCKSTEP (sim-only): see admission comment above.
+            if (simulatorLockstepRealtimeParking() || !gyroEnabled || firstSchedulingOpportunity || (taskRequiredTimeCycles < schedLoopRemainingCycles)) {
+#else
             if (!gyroEnabled || firstSchedulingOpportunity || (taskRequiredTimeCycles < schedLoopRemainingCycles)) {
+#endif
                 uint32_t antipatedEndCycles = nowCycles + taskRequiredTimeCycles;
                 taskExecutionTimeUs += schedulerExecuteTask(selectedTask, currentTimeUs);
                 nowCycles = getCycleCounter();
@@ -824,6 +884,11 @@ FAST_CODE void scheduler(void)
     UNUSED(taskExecutionTimeUs);
 #else
     DEBUG_SET(DEBUG_SCHEDULER, 2, micros() - schedulerStartTimeUs - taskExecutionTimeUs); // time spent in scheduler
+#endif
+
+#if defined(SIMULATOR_BUILD) && defined(SIMULATOR_GYROPID_SYNC) && !defined(UNIT_TEST)
+    // AXIO-LOCKSTEP (sim-only): no-op unless SITL_LOCKSTEP=1 (see sitl.c).
+    simulatorLockstepPassComplete(selectedTask != NULL);
 #endif
 
     scheduleCount++;
