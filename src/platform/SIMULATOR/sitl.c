@@ -97,11 +97,151 @@ static char simulator_ip[32] = "127.0.0.1";
 #define PORT_STATE      9003    // In
 #define PORT_RC         9004    // In
 
+// AV fork: snapshot of the last micros64() result for cross-thread readers.
+// micros64() itself is NOT thread-safe in stock mode (static accumulator
+// advanced by wall-delta * simRate); it must only ever be called from the
+// main loop. The TCP serial RX callback path (CRSF bytes, dyad thread)
+// needs a timestamp, so it reads this monotonic snapshot instead -- at the
+// main loop's ~9 kHz call rate it is at most ~0.1 ms stale, far below the
+// CRSF inter-frame gap the consumer measures.
+// (Hoisted above updateState() for AXIO-LOCKSTEP, which updates it from
+// the FDM thread on every clock step.)
+static _Atomic uint64_t microsSnapshot = 0;
+
+// ---- AXIO-LOCKSTEP (AV fork, sim-only) ---------------------------------
+// Deterministic lockstep mode, enabled with SITL_LOCKSTEP=1 in the
+// environment (default off: stock free-running behaviour, bit-identical
+// codepaths). In lockstep mode:
+//
+//  * micros64()/millis64() are derived exclusively from FDM packet
+//    timestamps (Gazebo sim time); the wall clock never advances them.
+//    Between FDM packets the firmware clock is FROZEN, so pausing Gazebo
+//    pauses Betaflight, and Gazebo running faster/slower than real time
+//    is invisible to the firmware.
+//  * Before the first streamed FDM packet ("engagement") the virtual
+//    clock advances only when the firmware itself sleeps (delay()/
+//    delayMicroseconds()), so boot consumes a deterministic amount of
+//    virtual time regardless of host load.
+//  * The PID/main loop is gated 1:1 on FDM arrival via
+//    SIMULATOR_GYROPID_SYNC + lockMainPID() (one PID iteration, hence
+//    exactly one motor packet, per FDM packet).
+//  * Optional: SITL_LOCKSTEP_RC_PLAN=<file> loads a scripted RC plan
+//    (lines: "<t_seconds> <ch0> <ch1> ... <chN>", up to 16 channels,
+//    missing channels default to 1500, '#' comments). Rows are applied
+//    synchronously in updateState() keyed to the VIRTUAL clock, before
+//    the clock advances past them -- a fully deterministic RC source
+//    (no wall-clock-paced UDP/TCP race). If set without SITL_LOCKSTEP,
+//    rows are keyed to the stock (wall*simRate) clock instead, which
+//    isolates clock nondeterminism in A/B experiments.
+static bool lockstepEnabled = false;
+static _Atomic uint64_t lockstepVirtualNs = 0; // the one true clock in lockstep mode
+static _Atomic bool lockstepEngaged = false;
+static uint64_t lockstepBaseNs = 0;            // virtual time at engagement
+static double lockstepTs0 = 0.0;               // FDM timestamp at engagement
+// Boot "idle warp": before the first motor packet has been sent there is no
+// FDM stream to advance the clock (the plugin only streams once it has seen
+// a motor packet), and the scheduler will never reach its gyro boundary on a
+// frozen clock. So while booting, each pass through the run() idle hook
+// advances the virtual clock by the requested idle period -- virtual boot
+// time is then a pure function of the scheduler pass count, NOT of wall
+// time or host load. The instant the first motor packet leaves (boot
+// complete, handshake initiated) the clock freezes until FDM engagement.
+static _Atomic bool lockstepBootMotorSent = false;
+
+#define LOCKSTEP_RC_PLAN_MAX_ROWS 512
+typedef struct {
+    double t;                                   // virtual-clock seconds
+    uint16_t ch[SIMULATOR_MAX_RC_CHANNELS];
+} lockstepRcRow_t;
+static lockstepRcRow_t lockstepRcPlan[LOCKSTEP_RC_PLAN_MAX_ROWS];
+static int lockstepRcPlanCount = 0;
+static int lockstepRcPlanNext = 0;
+
+static float readRCSITL(const rxRuntimeState_t *rxRuntimeState, uint8_t channel);
+static uint8_t rxRCFrameStatus(rxRuntimeState_t *rxRuntimeState);
+static void microsleep(uint32_t usec);
+
+static void lockstepLoadRcPlan(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[SITL][lockstep] cannot open RC plan '%s'\n", path);
+        exit(1);
+    }
+    char line[512];
+    while (lockstepRcPlanCount < LOCKSTEP_RC_PLAN_MAX_ROWS && fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+        lockstepRcRow_t *row = &lockstepRcPlan[lockstepRcPlanCount];
+        for (int i = 0; i < SIMULATOR_MAX_RC_CHANNELS; i++) {
+            row->ch[i] = 1500;
+        }
+        char *save = NULL;
+        char *tok = strtok_r(line, " ,\t", &save);
+        if (!tok) {
+            continue;
+        }
+        row->t = atof(tok);
+        int i = 0;
+        while (i < SIMULATOR_MAX_RC_CHANNELS && (tok = strtok_r(NULL, " ,\t\r\n", &save)) != NULL) {
+            row->ch[i++] = (uint16_t)atoi(tok);
+        }
+        lockstepRcPlanCount++;
+    }
+    fclose(f);
+    printf("[SITL][lockstep] RC plan '%s': %d rows, t=[%.3f..%.3f]\n", path,
+           lockstepRcPlanCount,
+           lockstepRcPlanCount ? lockstepRcPlan[0].t : 0.0,
+           lockstepRcPlanCount ? lockstepRcPlan[lockstepRcPlanCount - 1].t : 0.0);
+}
+
+// Apply every plan row that is due at virtual time `nowNs`. Called from the
+// FDM thread in updateState() BEFORE the clock is advanced to `nowNs`, so
+// the main loop consumes the new channel values exactly at that step.
+static void lockstepApplyRcPlan(uint64_t nowNs)
+{
+    if (lockstepRcPlanNext >= lockstepRcPlanCount) {
+        return;
+    }
+    const double tNow = nowNs * 1e-9;
+    bool applied = false;
+    while (lockstepRcPlanNext < lockstepRcPlanCount && lockstepRcPlan[lockstepRcPlanNext].t <= tNow) {
+        memcpy(rcPkt.channels, lockstepRcPlan[lockstepRcPlanNext].ch, sizeof(rcPkt.channels));
+        rcPkt.timestamp = lockstepRcPlan[lockstepRcPlanNext].t;
+        lockstepRcPlanNext++;
+        applied = true;
+    }
+    if (applied && !rc_received) {
+        // Same provider registration the UDP RC path performs on its first
+        // packet (udpRCThread); the plan replaces that wall-clock source.
+        rxRuntimeState.channelCount = SIMULATOR_MAX_RC_CHANNELS;
+        rxRuntimeState.rcReadRawFn = readRCSITL;
+        rxRuntimeState.rcFrameStatusFn = rxRCFrameStatus;
+        rxRuntimeState.rxProvider = RX_PROVIDER_UDP;
+        rc_received = true;
+        printf("[SITL][lockstep] RC plan source registered at t=%.3f\n", tNow);
+    }
+}
+// ---- end AXIO-LOCKSTEP state -------------------------------------------
+
 int targetParseArgs(int argc, char * argv[])
 {
     //The first argument should be target IP.
     if (argc > 1) {
         strcpy(simulator_ip, argv[1]);
+    }
+
+    // AXIO-LOCKSTEP: parse the environment as early as possible (this runs
+    // first thing in main()), so every later time query sees the mode.
+    const char *ls = getenv("SITL_LOCKSTEP");
+    if (ls && ls[0] && strcmp(ls, "0") != 0) {
+        lockstepEnabled = true;
+        printf("[SITL][lockstep] LOCKSTEP MODE ENABLED (SITL_LOCKSTEP=%s)\n", ls);
+    }
+    const char *plan = getenv("SITL_LOCKSTEP_RC_PLAN");
+    if (plan && plan[0]) {
+        lockstepLoadRcPlan(plan);
     }
 
     printf("[SITL] The SITL will output to IP %s:%d (Gazebo) and %s:%d (RealFlightBridge)\n",
@@ -113,7 +253,24 @@ int timeval_sub(struct timespec *result, struct timespec *x, struct timespec *y)
 
 int lockMainPID(void)
 {
+    // AXIO-LOCKSTEP: only gate the PID loop in lockstep mode. With the flag
+    // off this returns 0 ("lock acquired, run the loop"), which is exactly
+    // the stock behaviour when SIMULATOR_GYROPID_SYNC is not defined.
+    if (!lockstepEnabled) {
+        return 0;
+    }
     return pthread_mutex_trylock(&mainLoopLock);
+}
+
+// AXIO-LOCKSTEP: scheduler hook (see scheduler.c). When true, the realtime
+// gyro/filter/PID block parks in its boundary poll loop until the FDM
+// stream advances the clock -- exactly one realtime pass per sim step.
+// False during boot (the idle warp advances the clock between scheduler
+// passes, so the stock boundary logic works) and false in stock mode.
+bool simulatorLockstepRealtimeParking(void)
+{
+    return lockstepEnabled
+        && atomic_load_explicit(&lockstepBootMotorSent, memory_order_acquire);
 }
 
 #define RAD2DEG (180.0 / M_PI)
@@ -122,27 +279,42 @@ int lockMainPID(void)
 
 static void sendMotorUpdate(void)
 {
+    // (Does NOT set lockstepBootMotorSent: this path also serves the
+    // stale-FDM "anti-wedge" handshake reply, which can fire while the
+    // firmware is still booting. Only a PID-loop motor update proves boot
+    // is complete -- see pwmCompleteMotorUpdate().)
     udpSend(&pwmLink, &pwmPkt, sizeof(servo_packet));
 }
 
-static void updateState(const fdm_packet* pkt)
-{
-    static double last_timestamp = 0; // in seconds
-    static uint64_t last_realtime = 0; // in uS
-    static struct timespec last_ts; // last packet
+// FDM packet bookkeeping, shared between the receive path (udpThread) and
+// the apply path (which, in lockstep mode, runs on the MAIN thread -- see
+// updateStateApply / simulatorLockstepPassComplete).
+static double fdmLastTimestamp = 0;     // [s]
+static uint64_t fdmLastRealtimeUs = 0;  // [us] wall
+static struct timespec fdmLastTs;       // wall timespec of last applied packet
 
+// AXIO-LOCKSTEP deferred apply: at high real-time factors the next FDM
+// packet arrives while the main thread is still draining the non-realtime
+// tasks that became due at the previous step. Applying sensors/RC/clock
+// from the UDP thread at packet-arrival time would make that race (and so
+// the task schedule) wall-clock dependent -- empirically meters of
+// run-to-run divergence at ~50x real time. Instead the UDP thread only
+// BUFFERS the packet; the main thread applies it at the end of the first
+// scheduler pass that executed no task (drain complete), making the whole
+// step sequence a pure function of simulation state at any RTF.
+static pthread_mutex_t lockstepPendingLock = PTHREAD_MUTEX_INITIALIZER;
+static fdm_packet lockstepPendingPkt;
+static _Atomic bool lockstepPendingValid = false;
+
+// Applies one FDM packet to the firmware: sensors, (lockstep) RC plan and
+// virtual clock. Stock mode: called directly from the UDP thread (status
+// quo). Lockstep mode: called only from the main thread.
+static void updateStateApply(const fdm_packet* pkt)
+{
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
 
-    const uint64_t realtime_now = micros64_real();
-    if (realtime_now > last_realtime + 500*1e3) { // 500ms timeout
-        last_timestamp = pkt->timestamp;
-        last_realtime = realtime_now;
-        sendMotorUpdate();
-        return;
-    }
-
-    const double deltaSim = pkt->timestamp - last_timestamp;  // in seconds
+    const double deltaSim = pkt->timestamp - fdmLastTimestamp;  // in seconds
     if (deltaSim < 0) { // don't use old packet
         return;
     }
@@ -288,22 +460,118 @@ static void updateState(const fdm_packet* pkt)
     if (deltaSim < 0.02 && deltaSim > 0) { // simulator should run faster than 50Hz
 //        simRate = simRate * 0.5 + (1e6 * deltaSim / (realtime_now - last_realtime)) * 0.5;
         struct timespec out_ts;
-        timeval_sub(&out_ts, &now_ts, &last_ts);
+        timeval_sub(&out_ts, &now_ts, &fdmLastTs);
         simRate = deltaSim / (out_ts.tv_sec + 1e-9*out_ts.tv_nsec);
     }
 //    printf("simRate = %lf, millis64 = %lu, millis64_real = %lu, deltaSim = %lf\n", simRate, millis64(), millis64_real(), deltaSim*1e6);
 
-    last_timestamp = pkt->timestamp;
-    last_realtime = micros64_real();
+    fdmLastTimestamp = pkt->timestamp;
+    fdmLastRealtimeUs = micros64_real();
 
-    last_ts.tv_sec = now_ts.tv_sec;
-    last_ts.tv_nsec = now_ts.tv_nsec;
+    fdmLastTs.tv_sec = now_ts.tv_sec;
+    fdmLastTs.tv_nsec = now_ts.tv_nsec;
+
+    // AXIO-LOCKSTEP: compute the virtual time this packet advances us to,
+    // and apply any scripted RC rows that become due, BEFORE unlocking the
+    // main loop / publishing the new clock value. Ordering is load-bearing
+    // for determinism: sensor + RC state must be fully written before the
+    // main thread can observe the new time and run the gyro/PID pass.
+    uint64_t lockstepNowNs = 0;
+    if (lockstepEnabled) {
+        if (!atomic_load_explicit(&lockstepEngaged, memory_order_acquire)) {
+            lockstepBaseNs = atomic_load_explicit(&lockstepVirtualNs, memory_order_relaxed);
+            lockstepTs0 = pkt->timestamp;
+            atomic_store_explicit(&lockstepEngaged, true, memory_order_release);
+            printf("[SITL][lockstep] engaged: fdm_ts0=%.6f s, virtual_base=%.6f s\n",
+                   lockstepTs0, lockstepBaseNs * 1e-9);
+        }
+        lockstepNowNs = lockstepBaseNs + (uint64_t)llround((pkt->timestamp - lockstepTs0) * 1e9);
+        lockstepApplyRcPlan(lockstepNowNs);
+    } else if (lockstepRcPlanCount > 0) {
+        // Plan without lockstep (A/B isolation experiments): key rows to
+        // the stock clock via its cross-thread snapshot.
+        lockstepApplyRcPlan(atomic_load_explicit(&microsSnapshot, memory_order_relaxed) * 1000ULL);
+    }
 
     pthread_mutex_unlock(&updateLock); // can send PWM output now
 
 #if defined(SIMULATOR_GYROPID_SYNC)
-    pthread_mutex_unlock(&mainLoopLock); // can run main loop
+    if (lockstepEnabled) {
+        pthread_mutex_unlock(&mainLoopLock); // can run one main loop iteration
+    }
 #endif
+
+    if (lockstepEnabled) {
+        // Publish the new clock LAST: the next scheduler pass sees the
+        // boundary as due and runs exactly one realtime (gyro/PID) block.
+        atomic_store_explicit(&lockstepVirtualNs, lockstepNowNs, memory_order_release);
+        atomic_store_explicit(&microsSnapshot, lockstepNowNs / 1000, memory_order_relaxed);
+    }
+}
+
+// Receive path (udpThread).
+static void updateState(const fdm_packet* pkt)
+{
+    const uint64_t realtime_now = micros64_real();
+    if (realtime_now > fdmLastRealtimeUs + 500*1e3) { // 500ms timeout
+        fdmLastTimestamp = pkt->timestamp;
+        fdmLastRealtimeUs = realtime_now;
+        // AXIO-LOCKSTEP: once engaged, a long wall-clock gap is just Gazebo
+        // having been paused (or running very slowly) -- the virtual clock
+        // derives from absolute FDM timestamps and needs no re-baselining,
+        // and swallowing the packet here would hold the motors for one
+        // extra step (a real divergence seed after pause/resume; measured
+        // 1.4 m after 20 s open-loop). Process the packet normally; the
+        // gated PID loop produces the motor reply. The unconditional reply
+        // below remains for stock mode and for pre-engagement bring-up
+        // pokes (anti-wedge).
+        if (!lockstepEnabled || !atomic_load_explicit(&lockstepEngaged, memory_order_acquire)) {
+            sendMotorUpdate();
+            return;
+        }
+    }
+
+    if (lockstepEnabled) {
+        // AXIO-LOCKSTEP: while the firmware is still booting (no PID-loop
+        // motor update yet), ignore FDM *content* entirely: sensors, clock
+        // and RC plan state must stay a pure function of the deterministic
+        // virtual boot timeline, not of how much of the (wall-paced) FDM
+        // stream happened to arrive during boot. The stale-FDM handshake
+        // reply above still fires, so the plugin can come online while we
+        // boot; it re-syncs once the scheduler is running.
+        if (!atomic_load_explicit(&lockstepBootMotorSent, memory_order_acquire)) {
+            return;
+        }
+        // Deferred apply (see lockstepPendingLock above): latest packet
+        // wins; in a healthy lockstep there is at most one outstanding.
+        pthread_mutex_lock(&lockstepPendingLock);
+        lockstepPendingPkt = *pkt;
+        atomic_store_explicit(&lockstepPendingValid, true, memory_order_release);
+        pthread_mutex_unlock(&lockstepPendingLock);
+        return;
+    }
+
+    updateStateApply(pkt);
+}
+
+// AXIO-LOCKSTEP: called from scheduler.c at the end of every scheduler
+// pass (sim builds only). Applies the pending FDM packet -- sensors, RC
+// plan, clock step -- once the non-realtime task drain is complete (a pass
+// that executed no task), from the main thread.
+void simulatorLockstepPassComplete(bool ranTask)
+{
+    if (!lockstepEnabled || ranTask) {
+        return;
+    }
+    if (!atomic_load_explicit(&lockstepPendingValid, memory_order_acquire)) {
+        return;
+    }
+    fdm_packet pkt;
+    pthread_mutex_lock(&lockstepPendingLock);
+    pkt = lockstepPendingPkt;
+    atomic_store_explicit(&lockstepPendingValid, false, memory_order_relaxed);
+    pthread_mutex_unlock(&lockstepPendingLock);
+    updateStateApply(&pkt);
 }
 
 static void* udpThread(void* data)
@@ -492,17 +760,34 @@ uint64_t millis64_real(void)
     return 1.0e3*((ts.tv_sec + (ts.tv_nsec*1.0e-9)) - (start_time.tv_sec + (start_time.tv_nsec*1.0e-9)));
 }
 
-// AV fork: snapshot of the last micros64() result for cross-thread readers.
-// micros64() itself is NOT thread-safe (static accumulator advanced by
-// wall-delta * simRate); it must only ever be called from the main loop.
-// The TCP serial RX callback path (CRSF bytes, dyad thread) needs a
-// timestamp, so it reads this monotonic snapshot instead -- at the main
-// loop's ~9 kHz call rate it is at most ~0.1 ms stale, far below the CRSF
-// inter-frame gap the consumer measures.
-static _Atomic uint64_t microsSnapshot = 0;
+// (microsSnapshot declaration hoisted above updateState() -- see the
+// AXIO-LOCKSTEP block at the top of this file.)
 
 uint64_t micros64(void)
 {
+    // AXIO-LOCKSTEP: in lockstep mode the clock is the FDM-derived virtual
+    // time, frozen between packets. Reads are thread-safe. The main thread
+    // parks in the scheduler's boundary poll loop calling this at full
+    // speed; back off to 1 us sleeps once the value has provably stopped
+    // moving so a waiting (or paused) SITL does not burn a whole core.
+    // Sleeping never advances virtual time, so determinism is unaffected.
+    if (lockstepEnabled) {
+        static uint64_t lastSeenUs = 0;
+        static uint32_t sameCount = 0;
+        const uint64_t us = atomic_load_explicit(&lockstepVirtualNs, memory_order_acquire) / 1000;
+        if (us == lastSeenUs) {
+            // High threshold so short between-step task drains are never
+            // throttled; only a genuinely waiting/paused SITL backs off.
+            if (++sameCount > 1024) {
+                microsleep(1);
+            }
+        } else {
+            lastSeenUs = us;
+            sameCount = 0;
+        }
+        return us;
+    }
+
     static uint64_t last = 0;
     static uint64_t out = 0;
     uint64_t now = nanos64_real();
@@ -517,6 +802,11 @@ uint64_t micros64(void)
 
 uint64_t millis64(void)
 {
+    // AXIO-LOCKSTEP: see micros64().
+    if (lockstepEnabled) {
+        return atomic_load_explicit(&lockstepVirtualNs, memory_order_acquire) / (1000 * 1000);
+    }
+
     static uint64_t last = 0;
     static uint64_t out = 0;
     uint64_t now = nanos64_real();
@@ -582,16 +872,56 @@ static void microsleep(uint32_t usec)
 
 void delayMicroseconds(uint32_t us)
 {
+    // AXIO-LOCKSTEP: during boot, sleeping IS what advances the virtual
+    // clock -- deterministically and instantly. Once the scheduler is alive
+    // the clock belongs to the FDM stream; sleep in (unscaled) wall time.
+    if (lockstepEnabled) {
+        if (!atomic_load_explicit(&lockstepBootMotorSent, memory_order_acquire)) {
+            atomic_fetch_add_explicit(&lockstepVirtualNs, (uint64_t)us * 1000ULL, memory_order_relaxed);
+            return;
+        }
+        microsleep(us);
+        return;
+    }
     microsleep(us / simRate);
 }
 
 void delayMicroseconds_real(uint32_t us)
 {
+    // AXIO-LOCKSTEP: the only in-tree caller is the run() idle loop
+    // (RUN_LOOP_DELAY_US = 50).
+    if (lockstepEnabled) {
+        // Boot idle warp (see lockstepBootMotorSent): advance virtual time
+        // deterministically until the first PID-loop motor packet initiates
+        // the FDM handshake.
+        if (!atomic_load_explicit(&lockstepBootMotorSent, memory_order_acquire)) {
+            atomic_fetch_add_explicit(&lockstepVirtualNs, (uint64_t)us * 1000ULL, memory_order_relaxed);
+            return;
+        }
+        // Engaged (or waiting for engagement): the scheduler must react to
+        // FDM packets as fast as possible -- the step round-trip is the
+        // FTRT ceiling, and nanosleep() granularity is ~60 us regardless
+        // of the requested time, which would dominate it. Skip the idle
+        // sleep entirely; the frozen-clock backoff in micros64() throttles
+        // a genuinely idle (waiting/paused) SITL instead. Wall sleeping
+        // never advances sim time, so this is a latency/CPU trade only.
+        return;
+    }
     microsleep(us);
 }
 
 void delay(uint32_t ms)
 {
+    // AXIO-LOCKSTEP: during boot, advance the virtual clock directly
+    // (see delayMicroseconds). Afterwards, fall through to the stock
+    // spin: millis64() advances as FDM packets arrive. NOTE: if Gazebo is
+    // paused while the firmware sits in delay(), it stays here -- that is
+    // the lockstep contract (sim time is the only time).
+    if (lockstepEnabled && !atomic_load_explicit(&lockstepBootMotorSent, memory_order_acquire)) {
+        atomic_fetch_add_explicit(&lockstepVirtualNs, (uint64_t)ms * 1000000ULL, memory_order_relaxed);
+        return;
+    }
+
     uint64_t start = millis64();
 
     while ((millis64() - start) < ms) {
@@ -701,6 +1031,11 @@ static void pwmCompleteMotorUpdate(void)
 
     // get one "fdm_packet" can only send one "servo_packet"!!
     if (pthread_mutex_trylock(&updateLock) != 0) return;
+    // AXIO-LOCKSTEP: a PID-loop motor update means init is over and the
+    // scheduler is alive -- stop the boot idle warp and allow lockstep
+    // engagement (set BEFORE the send so the FDM reply can never race the
+    // flag).
+    atomic_store_explicit(&lockstepBootMotorSent, true, memory_order_release);
     udpSend(&pwmLink, &pwmPkt, sizeof(servo_packet));
 //    printf("[pwm]%u:%u,%u,%u,%u\n", idlePulse, motorsPwm[0], motorsPwm[1], motorsPwm[2], motorsPwm[3]);
     udpSend(&pwmRawLink, &pwmRawPkt, sizeof(servo_packet_raw));
