@@ -169,6 +169,7 @@ bool cliMode = false;
 #include "sensors/sensors.h"
 
 #include "telemetry/frsky_hub.h"
+#include "telemetry/state_link.h"
 #include "telemetry/telemetry.h"
 
 #include "cli.h"
@@ -4840,6 +4841,13 @@ static void cliStatus(const char *cmdName, char *cmdline)
     }
     cliPrintLinefeed();
 #endif // USE_GPS
+
+#ifdef USE_TELEMETRY_STATE_LINK
+    // Axiovel fork: axio-nav state link protocol/version banner for bench cross-checks
+    cliPrintf("STATE_LINK: protocol v%d, %s, %u Hz", STATE_LINK_PROTOCOL_VERSION,
+              stateLinkIsEnabled() ? "active" : "no port", stateLinkConfig()->rate_hz);
+    cliPrintLinefeed();
+#endif
 
 #if defined(USE_OSD)
     osdDisplayPortDevice_e displayPortDeviceType;

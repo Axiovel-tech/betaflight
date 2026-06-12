@@ -136,6 +136,7 @@
 
 #include "telemetry/frsky_hub.h"
 #include "telemetry/ibus_shared.h"
+#include "telemetry/state_link.h"
 #include "telemetry/telemetry.h"
 
 #include "settings.h"
@@ -1494,6 +1495,11 @@ const clivalue_t valueTable[] = {
     { "telemetry_disabled_sensors", VAR_UINT32 | MASTER_VALUE, .config.u32Max = SENSOR_ALL, PG_TELEMETRY_CONFIG, offsetof(telemetryConfig_t, disabledSensors)},
 #endif
 #endif // USE_TELEMETRY
+
+// PG_STATE_LINK_CONFIG (Axiovel fork: axio-nav state link)
+#ifdef USE_TELEMETRY_STATE_LINK
+    { "state_link_rate_hz",         VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { STATE_LINK_RATE_HZ_MIN, STATE_LINK_RATE_HZ_MAX }, PG_STATE_LINK_CONFIG, offsetof(stateLinkConfig_t, rate_hz) },
+#endif
 
 // PG_LED_STRIP_CONFIG
 #ifdef USE_LED_STRIP

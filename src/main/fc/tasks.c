@@ -102,6 +102,7 @@
 
 #include "telemetry/telemetry.h"
 #include "telemetry/crsf.h"
+#include "telemetry/state_link.h"
 
 #ifdef USE_BST
 #include "i2c_bst.h"
@@ -478,6 +479,12 @@ task_attribute_t task_attributes[TASK_COUNT] = {
 #ifdef USE_GIMBAL
     [TASK_GIMBAL] = DEFINE_TASK("GIMBAL", NULL, NULL, gimbalUpdate, TASK_PERIOD_HZ(100), TASK_PRIORITY_MEDIUM),
 #endif
+
+#ifdef USE_TELEMETRY_STATE_LINK
+    // Axiovel fork: axio-nav state link. Period is rescheduled from
+    // stateLinkConfig()->rate_hz in tasksInit().
+    [TASK_STATE_LINK] = DEFINE_TASK("STATE_LINK", NULL, NULL, stateLinkProcess, TASK_PERIOD_HZ(STATE_LINK_RATE_HZ_DEFAULT), TASK_PRIORITY_MEDIUM),
+#endif
 };
 
 task_t *getTask(unsigned taskId)
@@ -601,6 +608,14 @@ void tasksInit(void)
             // Reschedule telemetry to 500hz, 2ms for CRSF
             rescheduleTask(TASK_TELEMETRY, TASK_PERIOD_HZ(500));
         }
+    }
+#endif
+
+#ifdef USE_TELEMETRY_STATE_LINK
+    // Axiovel fork: axio-nav state link, enabled when its serial port is open
+    if (stateLinkIsEnabled()) {
+        rescheduleTask(TASK_STATE_LINK, TASK_PERIOD_HZ(constrain(stateLinkConfig()->rate_hz, STATE_LINK_RATE_HZ_MIN, STATE_LINK_RATE_HZ_MAX)));
+        setTaskEnabled(TASK_STATE_LINK, true);
     }
 #endif
 

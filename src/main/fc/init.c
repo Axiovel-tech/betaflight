@@ -174,6 +174,7 @@
 #include "sensors/initialisation.h"
 
 #include "telemetry/telemetry.h"
+#include "telemetry/state_link.h"
 
 #ifdef USE_HARDWARE_REVISION_DETECTION
 #include "hardware_revision.h"
@@ -964,6 +965,11 @@ void initPhase3(void)
     if (featureIsEnabled(FEATURE_TELEMETRY)) {
         telemetryInit();
     }
+#endif
+
+#ifdef USE_TELEMETRY_STATE_LINK
+    // Axiovel fork: axio-nav state link (independent of FEATURE_TELEMETRY)
+    stateLinkInit();
 #endif
 
     setArmingDisabled(ARMING_DISABLED_BOOT_GRACE_TIME);

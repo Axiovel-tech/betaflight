@@ -191,6 +191,9 @@ typedef enum {
 #ifdef USE_GIMBAL
     TASK_GIMBAL,
 #endif
+#ifdef USE_TELEMETRY_STATE_LINK
+    TASK_STATE_LINK, // Axiovel fork: axio-nav state link
+#endif
 
     /* Count of real tasks */
     TASK_COUNT,

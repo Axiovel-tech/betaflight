@@ -96,6 +96,9 @@
 #define DEFAULT_RX_FEATURE      FEATURE_RX_MSP
 #define DEFAULT_FEATURES        (FEATURE_GPS | FEATURE_TELEMETRY)
 
+// Axiovel fork: axio-nav state link, served over the SITL TCP serial ports
+#define USE_TELEMETRY_STATE_LINK
+
 #ifdef USE_GPS
 #define USE_VIRTUAL_GPS
 #endif

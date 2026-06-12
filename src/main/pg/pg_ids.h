@@ -159,6 +159,7 @@
 //#define PG_SOFTSERIAL_PIN_CONFIG    558  // removed, merged into SERIAL_PIN_CONFIG
 #define PG_GIMBAL_TRACK_CONFIG      559
 #define PG_OPTICALFLOW_CONFIG       560
+#define PG_STATE_LINK_CONFIG        561 // Axiovel fork: axio-nav state link
 
 
 // OSD configuration (subject to change)
