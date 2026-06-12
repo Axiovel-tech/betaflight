@@ -155,7 +155,9 @@ TEST(StateLinkTest, SampleStateMapsBetaflightToWireConventions)
     acc.accADC.y = 256.0f;      // +0.5 g
     acc.accADC.z = -1024.0f;    // -2 g
 
-    // Betaflight FLU->NWU quaternion -> wire FRD->NED: negate y/z components
+    // Quaternion mapping is build-dependent (see state_link.c):
+    //   - SITL FDM-injected attitude is already FRD->NED -> pass-through
+    //   - hardware Mahony attitude is FLU->NWU -> negate y/z components
     testQuaternion.w = 0.4f;
     testQuaternion.x = 0.5f;
     testQuaternion.y = 0.6f;
@@ -192,10 +194,22 @@ TEST(StateLinkTest, SampleStateMapsBetaflightToWireConventions)
     EXPECT_NEAR(-4.903325f, frame.accelMps2[1], 1e-4f);
     EXPECT_NEAR(19.6133f, frame.accelMps2[2], 1e-4f);
 
+#if defined(SIMULATOR_BUILD) && !defined(USE_IMU_CALC) && !defined(SET_IMU_FROM_EULER)
+    // SITL: internal quaternion already FRD->NED, transmitted unchanged.
+    // The previous unconditional negation double-converted here, putting
+    // nose-down-positive pitch (and mirrored yaw) on the wire -- the
+    // axio-nav PR-8 wobble-diagnosis side finding.
+    EXPECT_FLOAT_EQ(0.4f, frame.quat[0]);
+    EXPECT_FLOAT_EQ(0.5f, frame.quat[1]);
+    EXPECT_FLOAT_EQ(0.6f, frame.quat[2]);
+    EXPECT_FLOAT_EQ(-0.7f, frame.quat[3]);
+#else
+    // Hardware: FLU->NWU -> FRD->NED via the Rx(pi) similarity (negate y/z).
     EXPECT_FLOAT_EQ(0.4f, frame.quat[0]);
     EXPECT_FLOAT_EQ(0.5f, frame.quat[1]);
     EXPECT_FLOAT_EQ(-0.6f, frame.quat[2]);
     EXPECT_FLOAT_EQ(0.7f, frame.quat[3]);
+#endif
 
     EXPECT_EQ(0, frame.motor[0]);
     EXPECT_EQ(1024, frame.motor[1]);
@@ -336,6 +350,13 @@ void serialWriteBuf(serialPort_t *instance, const uint8_t *data, int count)
     UNUSED(instance);
     UNUSED(data);
     UNUSED(count);
+}
+
+// referenced by stateLinkProcess()'s SIMULATOR_BUILD branch
+void serialWrite(serialPort_t *instance, uint8_t ch)
+{
+    UNUSED(instance);
+    UNUSED(ch);
 }
 
 }

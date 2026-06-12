@@ -391,8 +391,14 @@ telemetry_state_link_unittest_SRC := \
 		$(USER_DIR)/common/maths.c \
 		$(USER_DIR)/common/streambuf.c
 
+# SIMULATOR_BUILD: exercise the SITL (gazebo-bridge) quaternion mapping --
+# the FDM-injected attitude is already FRD->NED, so the transmitter passes
+# it through (the hardware/Mahony build negates y/z instead; the unittest
+# asserts whichever branch is compiled). SITL is the only deployed
+# consumer of the state link today (axio-nav bench).
 telemetry_state_link_unittest_DEFINES := \
-		USE_TELEMETRY_STATE_LINK=
+		USE_TELEMETRY_STATE_LINK= \
+		SIMULATOR_BUILD=
 
 transponder_ir_unittest_SRC := \
 		$(USER_DIR)/drivers/transponder_ir_ilap.c \

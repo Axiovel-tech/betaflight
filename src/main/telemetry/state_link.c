@@ -34,7 +34,15 @@
  * about x, so the conversions used here are:
  *
  *   gyro/accel:  (x, y, z)_FRD = (x, -y, -z)_BF
- *   quaternion:  q_FRD->NED    = (w, x, -y, -z)_BF
+ *   quaternion:  q_FRD->NED    = (w, x, -y, -z)_BF   (hardware/Mahony)
+ *
+ * EXCEPTION (SITL): when the attitude is injected by the FDM
+ * (imuSetAttitudeQuat path in platform/SIMULATOR/sitl.c, i.e.
+ * SIMULATOR_BUILD without USE_IMU_CALC/SET_IMU_FROM_EULER), the internal
+ * quaternion is already body FRD -> world NED -- the same convention
+ * flight/imu.c compensates for with its simulator-only rMat sign flips.
+ * The transmitter passes it through unchanged in that configuration; see
+ * stateLinkSampleState().
  *
  * Data taps (provisional per spec, to be confirmed by the M2 bench
  * campaign):
@@ -135,13 +143,37 @@ void stateLinkSampleState(stateLinkStateFrame_t *frame, timeUs_t currentTimeUs)
     frame->accelMps2[1] = -acc.accADC.y * accScale;
     frame->accelMps2[2] = -acc.accADC.z * accScale;
 
-    // Betaflight attitude quaternion (body FLU -> world NWU) to FRD -> NED
+    // Betaflight attitude quaternion -> wire body FRD -> world NED.
+    //
+    // Two cases, matching exactly the build condition flight/imu.c uses
+    // for its simulator-only rMat sign compensation:
+    //
+    //  - Hardware (Mahony, flight/imu.c): the internal quaternion is the
+    //    body FLU -> world NWU attitude; FRD -> NED is the Rx(pi)
+    //    similarity, i.e. negate the y and z components.
+    //
+    //  - SITL with an FDM-injected attitude (imuSetAttitudeQuat in
+    //    platform/SIMULATOR/sitl.c): the injected quaternion is already
+    //    the body FRD -> world NED attitude (that is why imu.c flips
+    //    rMat[1][0]/rMat[2][0] under this same condition to recover the
+    //    native Euler readouts). Pass it through unchanged. The previous
+    //    unconditional negation double-converted here, putting
+    //    nose-down-positive pitch and mirrored yaw on the wire
+    //    (axio-nav PR-8 wobble-diagnosis side finding, verified against
+    //    horizontal acceleration on the M5 baseline).
     quaternion_t q;
     getQuaternion(&q);
+#if defined(SIMULATOR_BUILD) && !defined(USE_IMU_CALC) && !defined(SET_IMU_FROM_EULER)
+    frame->quat[0] = q.w;
+    frame->quat[1] = q.x;
+    frame->quat[2] = q.y;
+    frame->quat[3] = q.z;
+#else
     frame->quat[0] = q.w;
     frame->quat[1] = q.x;
     frame->quat[2] = -q.y;
     frame->quat[3] = -q.z;
+#endif
 
     // Post-mixer motor outputs, normalized to 0..2047 over the protocol
     // (DShot or PWM) output range. motorConvertToExternal() maps the
