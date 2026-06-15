@@ -83,6 +83,7 @@
 #include "drivers/serial.h"
 #include "drivers/time.h"
 
+#include "fc/rc_modes.h"
 #include "fc/runtime_config.h"
 
 #include "flight/failsafe.h"
@@ -279,6 +280,14 @@ void stateLinkSampleState(stateLinkStateFrame_t *frame, timeUs_t currentTimeUs)
         || (sensors(SENSOR_ACC) && !accIsCalibrationComplete())) {
         flags |= STATE_LINK_FLAG_CALIBRATING;
     }
+#if defined(USE_RX_MSP_OVERRIDE)
+    // axio-nav learns when the pilot has handed it the sticks (the
+    // BOXMSPOVERRIDE AUX switch) -> bumpless handover + switch-triggered
+    // mission start. Additive flag bit; pre-this receivers ignore it.
+    if (IS_RC_MODE_ACTIVE(BOXMSPOVERRIDE)) {
+        flags |= STATE_LINK_FLAG_MSP_OVERRIDE;
+    }
+#endif
     frame->flags = flags;
 
     frame->seq = stateLinkSeq;

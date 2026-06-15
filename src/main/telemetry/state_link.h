@@ -53,6 +53,7 @@
 #define STATE_LINK_FLAG_ARMED          (1 << 0)
 #define STATE_LINK_FLAG_FAILSAFE       (1 << 1)
 #define STATE_LINK_FLAG_CALIBRATING    (1 << 2)
+#define STATE_LINK_FLAG_MSP_OVERRIDE   (1 << 3)  // BOXMSPOVERRIDE active: axio-nav has stick control
 
 typedef struct stateLinkConfig_s {
     uint16_t rate_hz;       // STATE frame rate [Hz]
