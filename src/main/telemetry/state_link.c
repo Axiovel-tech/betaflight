@@ -146,7 +146,22 @@ void stateLinkSampleState(stateLinkStateFrame_t *frame, timeUs_t currentTimeUs)
     // Body FLU -> body FRD: negate y and z
     frame->gyroRadS[0] = DEGREES_TO_RADIANS(gyro.gyroADCf[X]);
     frame->gyroRadS[1] = -DEGREES_TO_RADIANS(gyro.gyroADCf[Y]);
+#if defined(SIMULATOR_BUILD) && !defined(USE_IMU_CALC) && !defined(SET_IMU_FROM_EULER)
+    // SITL with FDM-injected sensors (the same build condition as the
+    // quaternion/accel exceptions below): the Gazebo-bridge gyro
+    // injection (sitl.c, master 26524e20d backport) stores yaw as
+    // +wz_FRD (CW from above) -- NOT the hardware CCW+ convention the
+    // FLU->FRD negation expects -- so the unconditional -Z here
+    // double-flipped the wire yaw rate. Invisible to the v0/v1
+    // estimators (they never integrate the gyro); fatal to an attitude-
+    // mechanizing consumer (estimator v3). Empirical evidence from the
+    // pre-fix wire (axio-nav run 20260710-134148): per-axis correlation
+    // of the quaternion-implied body rates vs the wire gyro
+    // +0.999 / +0.998 / -0.994 (x/y/z).
+    frame->gyroRadS[2] = DEGREES_TO_RADIANS(gyro.gyroADCf[Z]);
+#else
     frame->gyroRadS[2] = -DEGREES_TO_RADIANS(gyro.gyroADCf[Z]);
+#endif
 
     // Betaflight attitude quaternion -> wire body FRD -> world NED.
     // (Sampled BEFORE the accel: the SITL accel branch below needs the
